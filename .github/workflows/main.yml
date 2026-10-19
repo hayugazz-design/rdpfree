@@ -1,5 +1,5 @@
-
-name: RDP_Ubuntu_XFCE_Tailscale
+```yaml
+name: SSH_Ubuntu_Tailscale
 
 on:
   workflow_dispatch:
@@ -7,120 +7,106 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: rdp-xfce-${{ github.run_id }}
-  cancel-in-progress: true
-
 jobs:
-  secure-rdp:
+  ssh-server:
     runs-on: ubuntu-24.04
     timeout-minutes: 350
 
     steps:
-      - name: Install XFCE and xRDP
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install and configure SSH
         shell: bash
         env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
         run: |
           set -euo pipefail
-          set +x
 
-          if [[ -z "${RDP_PASSWORD:-}" ]]; then
-            echo "::error::RDP_PASSWORD secret is missing."
+          sudo apt-get update
+          sudo apt-get install -y openssh-server ufw
+
+          # Create a dedicated SSH user
+          if ! id sshuser >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash sshuser
+          fi
+
+          # Set password from GitHub Secret
+          if [ -z "${SSH_PASSWORD:-}" ]; then
+            echo "::error::SSH_PASSWORD secret is missing."
             exit 1
           fi
 
-          sudo apt-get update
-          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            xfce4 \
-            xfce4-goodies \
-            xrdp \
-            xorgxrdp \
-            dbus-x11 \
-            dbus-daemon \
-            ufw
+          printf 'sshuser:%s\n' "$SSH_PASSWORD" | sudo chpasswd
+          unset SSH_PASSWORD
 
-          if ! id rdp >/dev/null 2>&1; then
-            sudo useradd -m -s /bin/bash rdp
-          fi
+          # Configure SSH to use password authentication
+          sudo tee /etc/ssh/sshd_config.d/99-github-runner.conf >/dev/null <<'EOF'
+          Port 22
+          PasswordAuthentication yes
+          KbdInteractiveAuthentication no
+          PermitRootLogin no
+          AllowUsers sshuser
+          EOF
 
-          printf 'rdp:%s\n' "$RDP_PASSWORD" | sudo chpasswd
-          unset RDP_PASSWORD
+          sudo sshd -t
+          sudo systemctl enable --now ssh
+          sudo systemctl restart ssh
 
-          # Start XFCE instead of KDE Plasma.
-          printf '%s\n' \
-            '#!/bin/sh' \
-            'exec startxfce4' \
-            | sudo tee /home/rdp/.xsession >/dev/null
-
-          sudo chown rdp:rdp /home/rdp/.xsession
-          sudo chmod 700 /home/rdp/.xsession
-
-          sudo adduser xrdp ssl-cert
-          sudo systemctl enable xrdp
-          sudo systemctl restart xrdp
-
-     
-    
       - name: Connect to Tailscale
         uses: tailscale/github-action@v4
         with:
           authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
-          hostname: gh-xfce-${{ github.run_id }}
+          hostname: gh-ssh-${{ github.run_id }}
 
-
-
-      - name: Configure firewall and verify xRDP
+      - name: Configure firewall and verify SSH
         shell: bash
         run: |
           set -euo pipefail
 
-          TS_IP="$(tailscale ip -4 | head -n 1)"
+          sudo ufw --force reset
+          sudo ufw default deny incoming
+          sudo ufw default allow outgoing
+          sudo ufw allow in on tailscale0 to any port 22 proto tcp
+          sudo ufw --force enable
 
-          if [[ -z "$TS_IP" ]]; then
-            echo "::error::Tailscale IP unavailable."
+          sudo systemctl restart ssh
+          sleep 2
+
+          if ! sudo systemctl is-active --quiet ssh; then
+            sudo systemctl status ssh --no-pager || true
+            echo "::error::SSH service is not active."
             exit 1
           fi
 
-          # Permit RDP only through the Tailscale interface.
-          sudo ufw default deny incoming
-          sudo ufw default allow outgoing
-          sudo ufw allow in on tailscale0 \
-            to any port 3389 proto tcp
-          sudo ufw --force enable
+          if ! timeout 5 bash -c '</dev/tcp/127.0.0.1/22'; then
+            echo "::error::SSH port 22 is not listening."
+            exit 1
+          fi
 
-          for i in $(seq 1 30); do
-            if timeout 2 bash -c \
-              'echo > /dev/tcp/127.0.0.1/3389' \
-              2>/dev/null; then
-              break
-            fi
-            sleep 2
-          done
+          TS_IP="$(tailscale ip -4 | head -n 1)"
 
-          if ! timeout 3 bash -c \
-            'echo > /dev/tcp/127.0.0.1/3389' \
-            2>/dev/null; then
-            echo "::error::xRDP failed to start."
-            sudo systemctl --no-pager status xrdp || true
+          if [ -z "$TS_IP" ]; then
+            echo "::error::Could not obtain Tailscale IPv4."
             exit 1
           fi
 
           echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
-          echo "XFCE RDP service is ready."
 
-      - name: Maintain temporary session
+      - name: Keep SSH server running
         shell: bash
         run: |
-          set -euo pipefail
-
-          echo "Temporary XFCE desktop is ready."
-          echo "Address: $TAILSCALE_IP"
-          echo "Username: rdp"
-          echo "Password: use GitHub secret RDP_PASSWORD."
-          echo "Use a Tailscale-connected client."
+          echo "======================================"
+          echo " Temporary Ubuntu SSH Server"
+          echo "======================================"
+          echo "Tailscale IP: ${TAILSCALE_IP}"
+          echo "SSH Port    : 22"
+          echo "Username    : sshuser"
+          echo "Password    : GitHub secret SSH_PASSWORD"
+          echo "Connect via the same Tailscale network."
+          echo "======================================"
 
           while true; do
-            echo "[$(date -u '+%H:%M:%S UTC')] XFCE active"
             sleep 300
           done
+```
