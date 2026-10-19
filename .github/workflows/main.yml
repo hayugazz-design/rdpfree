@@ -16,7 +16,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install SSH Server
+      - name: Install and Configure SSH Server
         shell: bash
         run: |
           set -euo pipefail
@@ -24,13 +24,23 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y openssh-server ufw
 
+          # Create a dedicated, non-root SSH user
           if ! id sshuser >/dev/null 2>&1; then
             sudo useradd --create-home --shell /bin/bash sshuser
           fi
 
-          # Password login is disabled; use SSH key authentication.
-          sudo install -d -m 700 -o sshuser -g sshuser /home/sshuser/.ssh
+          # Create SSH runtime directory
+          sudo mkdir -p /run/sshd
+          sudo chmod 755 /run/sshd
 
+          # Prepare SSH directory
+          sudo install -d \
+            -m 700 \
+            -o sshuser \
+            -g sshuser \
+            /home/sshuser/.ssh
+
+          # Configure SSH to use public-key authentication only
           sudo tee /etc/ssh/sshd_config.d/99-github-runner.conf >/dev/null <<'EOF'
           Port 22
           PermitRootLogin no
@@ -40,6 +50,7 @@ jobs:
           AllowUsers sshuser
           EOF
 
+          # Validate configuration and start SSH
           sudo sshd -t
           sudo systemctl enable --now ssh
           sudo systemctl restart ssh
@@ -62,18 +73,27 @@ jobs:
             exit 1
           fi
 
+          # Install your public key
           printf '%s\n' "$SSH_PUBLIC_KEY" \
             | sudo tee /home/sshuser/.ssh/authorized_keys >/dev/null
 
-          sudo chown sshuser:sshuser /home/sshuser/.ssh/authorized_keys
-          sudo chmod 600 /home/sshuser/.ssh/authorized_keys
+          sudo chown sshuser:sshuser \
+            /home/sshuser/.ssh/authorized_keys
+          sudo chmod 600 \
+            /home/sshuser/.ssh/authorized_keys
 
+          # Permit SSH only through the Tailscale interface
           sudo ufw --force reset
           sudo ufw default deny incoming
           sudo ufw default allow outgoing
           sudo ufw allow in on tailscale0 to any port 22 proto tcp
           sudo ufw --force enable
 
+          # Recreate runtime directory before validating SSH
+          sudo mkdir -p /run/sshd
+          sudo chmod 755 /run/sshd
+
+          sudo sshd -t
           sudo systemctl restart ssh
           sleep 2
 
@@ -85,13 +105,14 @@ jobs:
 
           if ! timeout 5 bash -c '</dev/tcp/127.0.0.1/22'; then
             echo "::error::SSH port 22 is not listening."
+            sudo journalctl -u ssh --no-pager -n 50 || true
             exit 1
           fi
 
           TS_IP="$(tailscale ip -4 | head -n 1)"
 
           if [ -z "$TS_IP" ]; then
-            echo "::error::Could not get Tailscale IPv4."
+            echo "::error::Could not obtain Tailscale IPv4."
             exit 1
           fi
 
@@ -100,6 +121,8 @@ jobs:
       - name: SSH Server Ready
         shell: bash
         run: |
+          set -euo pipefail
+
           echo "======================================"
           echo " Ubuntu SSH Server Ready"
           echo "======================================"
