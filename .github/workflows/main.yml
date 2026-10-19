@@ -61,11 +61,13 @@ jobs:
           sudo systemctl restart xrdp
 
      
+    
       - name: Connect to Tailscale
         uses: tailscale/github-action@v4
         with:
           authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
-          args: --hostname=gh-xfce-${{ github.run_id }}
+          hostname: gh-xfce-${{ github.run_id }}
+
 
 
       - name: Configure firewall and verify xRDP
