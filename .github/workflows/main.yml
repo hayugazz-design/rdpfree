@@ -1,4 +1,4 @@
-```yaml
+
 name: Ubuntu_SSH_Tailscale
 
 on:
@@ -112,4 +112,4 @@ jobs:
           while true; do
             sleep 300
           done
-```
+
