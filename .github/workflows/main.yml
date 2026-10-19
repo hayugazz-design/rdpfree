@@ -1,4 +1,4 @@
-```yaml
+
 name: Ubuntu_SSH_Tailscale
 
 on:
@@ -29,24 +29,30 @@ jobs:
             sudo useradd --create-home --shell /bin/bash sshuser
           fi
 
-          # Allow sudo without password for this temporary runner
+          # Configure passwordless sudo for sshuser
           echo 'sshuser ALL=(ALL:ALL) NOPASSWD:ALL' \
             | sudo tee /etc/sudoers.d/sshuser >/dev/null
+
+          sudo chown root:root /etc/sudoers.d/sshuser
           sudo chmod 440 /etc/sudoers.d/sshuser
           sudo visudo -cf /etc/sudoers.d/sshuser
 
-          # SSH runtime directory
+          # Verify sudo configuration before starting SSH
+          sudo -n -l -U sshuser
+          sudo -u sshuser sudo -n whoami
+
+          # Prepare SSH runtime directory
           sudo mkdir -p /run/sshd
           sudo chmod 755 /run/sshd
 
-          # SSH directory
+          # Prepare SSH directory
           sudo install -d \
             -m 700 \
             -o sshuser \
             -g sshuser \
             /home/sshuser/.ssh
 
-          # SSH configuration: public-key authentication only
+          # SSH public-key authentication only
           sudo tee /etc/ssh/sshd_config.d/99-github-runner.conf >/dev/null <<'EOF'
           Port 22
           PermitRootLogin no
@@ -78,6 +84,16 @@ jobs:
             exit 1
           fi
 
+          # Validate that the supplied key is an SSH public key
+          case "$SSH_PUBLIC_KEY" in
+            ssh-ed25519\ *|ssh-rsa\ *|ecdsa-sha2-nistp256\ *)
+              ;;
+            *)
+              echo "::error::SSH_PUBLIC_KEY does not look like a supported public key."
+              exit 1
+              ;;
+          esac
+
           # Install public key
           printf '%s\n' "$SSH_PUBLIC_KEY" \
             | sudo tee /home/sshuser/.ssh/authorized_keys >/dev/null
@@ -94,7 +110,7 @@ jobs:
           sudo ufw allow in on tailscale0 to any port 22 proto tcp
           sudo ufw --force enable
 
-          # Validate and restart SSH
+          # Validate SSH configuration
           sudo mkdir -p /run/sshd
           sudo chmod 755 /run/sshd
           sudo sshd -t
@@ -113,7 +129,12 @@ jobs:
             exit 1
           fi
 
+          # Verify passwordless sudo configuration
+          sudo -u sshuser sudo -n whoami
+
+          # Get Tailscale IPv4
           TS_IP="$(tailscale ip -4 | head -n 1)"
+
           if [ -z "$TS_IP" ]; then
             echo "::error::Could not obtain Tailscale IPv4."
             exit 1
@@ -133,9 +154,9 @@ jobs:
           echo "Port     : 22"
           echo "Username : sshuser"
           echo "Root     : sudo -i"
+          echo "Auth     : SSH public key"
           echo "======================================"
 
           while true; do
             sleep 300
           done
-```
