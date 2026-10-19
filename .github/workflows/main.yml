@@ -1,5 +1,5 @@
 
-name: RDP_Ubuntu_KDE_Tailscale
+name: RDP_Ubuntu_XFCE_Tailscale
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: rdp-kde-${{ github.run_id }}
+  group: rdp-xfce-${{ github.run_id }}
   cancel-in-progress: true
 
 jobs:
@@ -17,7 +17,7 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      - name: Install KDE Plasma and xRDP
+      - name: Install XFCE and xRDP
         shell: bash
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
@@ -32,67 +32,60 @@ jobs:
 
           sudo apt-get update
           sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            plasma-desktop \
-            plasma-workspace \
+            xfce4 \
+            xfce4-goodies \
             xrdp \
             xorgxrdp \
             dbus-x11 \
             dbus-daemon \
-            xserver-xorg-core \
             ufw
 
           if ! id rdp >/dev/null 2>&1; then
-            sudo useradd --create-home --shell /bin/bash rdp
+            sudo useradd -m -s /bin/bash rdp
           fi
 
-          # Set password through stdin; never print it.
           printf 'rdp:%s\n' "$RDP_PASSWORD" | sudo chpasswd
           unset RDP_PASSWORD
 
-          # Configure the desktop session for xRDP.
+          # Start XFCE instead of KDE Plasma.
           printf '%s\n' \
             '#!/bin/sh' \
-            'exec dbus-run-session startplasma-x11' \
+            'exec startxfce4' \
             | sudo tee /home/rdp/.xsession >/dev/null
 
           sudo chown rdp:rdp /home/rdp/.xsession
           sudo chmod 700 /home/rdp/.xsession
 
-          # Permit xRDP to use its required TLS certificate group.
           sudo adduser xrdp ssl-cert
-
           sudo systemctl enable xrdp
           sudo systemctl restart xrdp
 
-          # Limit inbound RDP to the Tailscale interface.
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          args: --hostname=gh-xfce-${{ github.run_id }}
+
+      - name: Configure firewall and verify xRDP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TS_IP="$(tailscale ip -4 | head -n 1)"
+
+          if [[ -z "$TS_IP" ]]; then
+            echo "::error::Tailscale IP unavailable."
+            exit 1
+          fi
+
+          # Permit RDP only through the Tailscale interface.
           sudo ufw default deny incoming
           sudo ufw default allow outgoing
           sudo ufw allow in on tailscale0 \
             to any port 3389 proto tcp
           sudo ufw --force enable
-
-      - name: Connect to Tailscale
-        uses: tailscale/github-action@v3
-        with:
-          authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
-          args: --hostname=gh-kde-${{ github.run_id }}
-
-      - name: Verify private network and xRDP
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          TS_BIN="$(command -v tailscale)"
-          TS_IP="$("$TS_BIN" ip -4 | head -n 1)"
-
-          if [[ -z "$TS_IP" ]]; then
-            echo "::error::Tailscale did not assign an IPv4 address."
-            exit 1
-          fi
-
-          echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
-
-          echo "Waiting for xRDP to start..."
 
           for i in $(seq 1 30); do
             if timeout 2 bash -c \
@@ -106,29 +99,26 @@ jobs:
           if ! timeout 3 bash -c \
             'echo > /dev/tcp/127.0.0.1/3389' \
             2>/dev/null; then
-            echo "::error::xRDP is not listening on port 3389."
+            echo "::error::xRDP failed to start."
             sudo systemctl --no-pager status xrdp || true
             exit 1
           fi
 
-          sudo ufw status
-          echo "Tailscale IP assigned successfully."
-          echo "Local xRDP listener is responding."
+          echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
+          echo "XFCE RDP service is ready."
 
       - name: Maintain temporary session
         shell: bash
-        env:
-          RDP_USER: rdp
         run: |
           set -euo pipefail
 
-          echo "Temporary KDE Plasma RDP session is ready."
+          echo "Temporary XFCE desktop is ready."
           echo "Address: $TAILSCALE_IP"
-          echo "Username: $RDP_USER"
-          echo "Password: use the configured RDP_PASSWORD secret."
-          echo "Do not share this workflow's access details."
+          echo "Username: rdp"
+          echo "Password: use GitHub secret RDP_PASSWORD."
+          echo "Use a Tailscale-connected client."
 
           while true; do
-            echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] Session active."
+            echo "[$(date -u '+%H:%M:%S UTC')] XFCE active"
             sleep 300
           done
