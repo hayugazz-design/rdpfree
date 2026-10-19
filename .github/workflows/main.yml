@@ -1,5 +1,5 @@
 ```yaml
-name: SSH_Ubuntu_Tailscale
+name: Ubuntu_SSH_Tailscale
 
 on:
   workflow_dispatch:
@@ -16,36 +16,27 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install and configure SSH
+      - name: Install SSH Server
         shell: bash
-        env:
-          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
         run: |
           set -euo pipefail
 
           sudo apt-get update
           sudo apt-get install -y openssh-server ufw
 
-          # Create a dedicated SSH user
           if ! id sshuser >/dev/null 2>&1; then
-            sudo useradd -m -s /bin/bash sshuser
+            sudo useradd --create-home --shell /bin/bash sshuser
           fi
 
-          # Set password from GitHub Secret
-          if [ -z "${SSH_PASSWORD:-}" ]; then
-            echo "::error::SSH_PASSWORD secret is missing."
-            exit 1
-          fi
+          # Password login is disabled; use SSH key authentication.
+          sudo install -d -m 700 -o sshuser -g sshuser /home/sshuser/.ssh
 
-          printf 'sshuser:%s\n' "$SSH_PASSWORD" | sudo chpasswd
-          unset SSH_PASSWORD
-
-          # Configure SSH to use password authentication
           sudo tee /etc/ssh/sshd_config.d/99-github-runner.conf >/dev/null <<'EOF'
           Port 22
-          PasswordAuthentication yes
-          KbdInteractiveAuthentication no
           PermitRootLogin no
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          PubkeyAuthentication yes
           AllowUsers sshuser
           EOF
 
@@ -59,10 +50,23 @@ jobs:
           authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
           hostname: gh-ssh-${{ github.run_id }}
 
-      - name: Configure firewall and verify SSH
+      - name: Configure SSH Key and Firewall
         shell: bash
+        env:
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
         run: |
           set -euo pipefail
+
+          if [ -z "${SSH_PUBLIC_KEY:-}" ]; then
+            echo "::error::SSH_PUBLIC_KEY secret is missing."
+            exit 1
+          fi
+
+          printf '%s\n' "$SSH_PUBLIC_KEY" \
+            | sudo tee /home/sshuser/.ssh/authorized_keys >/dev/null
+
+          sudo chown sshuser:sshuser /home/sshuser/.ssh/authorized_keys
+          sudo chmod 600 /home/sshuser/.ssh/authorized_keys
 
           sudo ufw --force reset
           sudo ufw default deny incoming
@@ -87,23 +91,22 @@ jobs:
           TS_IP="$(tailscale ip -4 | head -n 1)"
 
           if [ -z "$TS_IP" ]; then
-            echo "::error::Could not obtain Tailscale IPv4."
+            echo "::error::Could not get Tailscale IPv4."
             exit 1
           fi
 
           echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
 
-      - name: Keep SSH server running
+      - name: SSH Server Ready
         shell: bash
         run: |
           echo "======================================"
-          echo " Temporary Ubuntu SSH Server"
+          echo " Ubuntu SSH Server Ready"
           echo "======================================"
-          echo "Tailscale IP: ${TAILSCALE_IP}"
-          echo "SSH Port    : 22"
-          echo "Username    : sshuser"
-          echo "Password    : GitHub secret SSH_PASSWORD"
-          echo "Connect via the same Tailscale network."
+          echo "Host     : ${TAILSCALE_IP}"
+          echo "Port     : 22"
+          echo "Username : sshuser"
+          echo "Auth     : SSH private key"
           echo "======================================"
 
           while true; do
