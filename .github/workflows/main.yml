@@ -26,56 +26,72 @@ jobs:
           authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
           hostname: gh-arch-ssh-${{ github.run_id }}
 
-      - name: Validate configuration and start Arch SSH
+      - name: Validate secrets
         shell: bash
         env:
           SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+          ROOT_PASSWORD: ${{ secrets.ROOT_PASSWORD }}
         run: |
-          set -Eeuo pipefail
+          set -euo pipefail
 
-          # Check required secret without displaying its value.
           if [[ -z "${SSH_PUBLIC_KEY:-}" ]]; then
-            echo "::error::SSH_PUBLIC_KEY secret is missing."
+            echo "::error::SSH_PUBLIC_KEY is missing."
             exit 1
           fi
 
-          # Validate the public key using OpenSSH tools.
+          if [[ -z "${ROOT_PASSWORD:-}" ]]; then
+            echo "::error::ROOT_PASSWORD is missing."
+            exit 1
+          fi
+
           KEY_FILE="$(mktemp)"
-          chmod 600 "$KEY_FILE"
           trap 'rm -f "$KEY_FILE"' EXIT
 
           printf '%s\n' "$SSH_PUBLIC_KEY" > "$KEY_FILE"
 
-          if ! ssh-keygen -l -f "$KEY_FILE" >/dev/null 2>&1; then
-            echo "::error::SSH_PUBLIC_KEY is not a valid SSH public key."
+          if ! ssh-keygen -lf "$KEY_FILE" >/dev/null 2>&1; then
+            echo "::error::Invalid SSH public key."
             exit 1
           fi
 
-          # Obtain the Tailscale IPv4 address.
+          echo "Required secrets validated."
+
+      - name: Start Arch Linux container and configure SSH
+        shell: bash
+        env:
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+          ROOT_PASSWORD: ${{ secrets.ROOT_PASSWORD }}
+        run: |
+          set -Eeuo pipefail
+          set +x
+
+          KEY_FILE="$(mktemp)"
+          trap 'rm -f "$KEY_FILE"' EXIT
+
+          printf '%s\n' "$SSH_PUBLIC_KEY" > "$KEY_FILE"
+          unset SSH_PUBLIC_KEY
+
           TS_IP="$(tailscale ip -4 | head -n 1)"
 
           if [[ -z "$TS_IP" ]]; then
-            echo "::error::Could not obtain Tailscale IPv4."
+            echo "::error::Tailscale IPv4 address unavailable."
             exit 1
           fi
 
-          # Ensure Docker is available.
           docker info >/dev/null
-
-          # Start the official Arch Linux container.
           docker pull archlinux:latest
 
           docker rm -f arch-ssh >/dev/null 2>&1 || true
 
+          # Bind port 22 only to the host's Tailscale IPv4.
           docker run -d \
             --name arch-ssh \
-            --network host \
+            --publish "${TS_IP}:22:22" \
             --restart unless-stopped \
-            --env TS_IP="$TS_IP" \
             archlinux:latest \
             sleep infinity
 
-          # Initialize Arch Linux package signing keys.
+          # Initialize Arch package manager and install OpenSSH.
           docker exec arch-ssh bash -lc '
             set -e
             pacman-key --init
@@ -83,12 +99,13 @@ jobs:
             pacman -Syu --noconfirm openssh
           '
 
-          # Install the SSH public key without printing it.
+          # Install the public key for root.
           docker exec arch-ssh install -d \
             -m 700 -o root -g root /root/.ssh
 
-          docker exec -i arch-ssh bash -c \
-            'cat > /root/.ssh/authorized_keys' < "$KEY_FILE"
+          docker exec -i arch-ssh \
+            bash -c 'cat > /root/.ssh/authorized_keys' \
+            < "$KEY_FILE"
 
           docker exec arch-ssh chown root:root \
             /root/.ssh/authorized_keys
@@ -96,8 +113,14 @@ jobs:
           docker exec arch-ssh chmod 600 \
             /root/.ssh/authorized_keys
 
-          # Bind SSH only to the Tailscale address.
-          docker exec -e TS_IP="$TS_IP" arch-ssh bash -lc '
+          # Configure root password and SSH authentication.
+          # Password is supplied through a GitHub Actions secret.
+          printf '%s:%s\n' root "$ROOT_PASSWORD" \
+            | docker exec -i arch-ssh chpasswd
+
+          unset ROOT_PASSWORD
+
+          docker exec arch-ssh bash -lc '
             set -e
 
             install -d -m 755 /run/sshd
@@ -106,17 +129,19 @@ jobs:
             cat > /etc/ssh/sshd_config <<EOF
           Port 22
           AddressFamily inet
-          ListenAddress ${TS_IP}
+          ListenAddress 0.0.0.0
           HostKey /etc/ssh/ssh_host_ed25519_key
-          PermitRootLogin prohibit-password
+          PermitRootLogin yes
           PubkeyAuthentication yes
-          AuthenticationMethods publickey
-          PasswordAuthentication no
+          PasswordAuthentication yes
           KbdInteractiveAuthentication no
-          UsePAM no
-          AllowUsers root
+          AuthenticationMethods any
           PermitEmptyPasswords no
+          AllowUsers root
+          UsePAM no
           X11Forwarding no
+          AllowTcpForwarding no
+          PermitTunnel no
           PrintMotd no
           EOF
 
@@ -124,32 +149,56 @@ jobs:
             /usr/bin/sshd -t
           '
 
-          # Launch sshd in the running container.
+          # Start sshd in the background inside the container.
           docker exec -d arch-ssh /usr/bin/sshd -D -e
 
-          # Wait for SSH to listen on the Tailscale IP.
+          # Wait for the published SSH port to become available.
           READY=0
 
-          for attempt in $(seq 1 20); do
+          for attempt in $(seq 1 30); do
             if timeout 2 bash -c \
               'exec 3<>/dev/tcp/$1/22' _ "$TS_IP" \
               2>/dev/null; then
               READY=1
               break
             fi
+
             sleep 2
           done
 
           if [[ "$READY" != "1" ]]; then
-            echo "::error::SSH did not become ready."
-            docker logs --tail 50 arch-ssh || true
+            echo "::error::SSH port 22 did not become available."
+            docker logs --tail 80 arch-ssh || true
             exit 1
           fi
 
-          # Print connection details only.
           {
             echo "TAILSCALE_IP=$TS_IP"
           } >> "$GITHUB_ENV"
+
+          echo "Arch SSH setup completed."
+
+      - name: Verify SSH server
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker exec arch-ssh bash -lc '
+            echo "OS:"
+            cat /etc/os-release | head -n 3
+
+            echo
+            echo "SSH configuration:"
+            /usr/bin/sshd -t
+
+            echo
+            echo "SSH process:"
+            pgrep -a sshd
+          '
+
+          echo "Tailscale IP: ${TAILSCALE_IP}"
+          echo "SSH port: 22"
+          echo "Login user: root"
 
       - name: Arch SSH Ready
         shell: bash
@@ -162,7 +211,7 @@ jobs:
           echo "Host     : ${TAILSCALE_IP}"
           echo "Port     : 22"
           echo "Username : root"
-          echo "Auth     : SSH public key only"
+          echo "Auth     : Public key and password"
           echo "OS       : Arch Linux container"
           echo "======================================"
 
@@ -170,7 +219,7 @@ jobs:
             sleep 300
           done
 
-      - name: Remove Arch container
+      - name: Cleanup Arch container
         if: ${{ always() }}
         shell: bash
         run: |
