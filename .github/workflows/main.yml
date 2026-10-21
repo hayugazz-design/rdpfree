@@ -14,7 +14,7 @@ concurrency:
 jobs:
   arch-ssh:
     runs-on: ubuntu-24.04
-    timeout-minutes: 350
+    timeout-minutes: 1200
 
     steps:
       - name: Checkout repository
